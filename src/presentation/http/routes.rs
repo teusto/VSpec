@@ -1,8 +1,16 @@
 use crate::{
     app::AppState,
-    infrastructure::persistence::spec::{SpecContentTemplate, SpecTag},
+    infrastructure::persistence::{
+        project::{NewProject, Project, ProjectRepository},
+        spec::{NewSpec, RepoError, Spec, SpecContentTemplate, SpecTag},
+    },
 };
-use axum::{Json, Router, extract::Path, http::StatusCode, routing::get};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::get,
+};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -26,18 +34,95 @@ async fn health() -> &'static str {
 }
 
 /// `GET /projects` placeholder endpoint that lists projects.
-async fn list_projects() -> &'static str {
-    "list projects"
+async fn list_projects(State(state): State<AppState>) -> Result<Json<Vec<ProjectResponse>>, StatusCode> {
+    let conn = state.conn.clone();
+
+    let projects = tokio::task::spawn_blocking(move || {
+        let conn = conn
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let repo = ProjectRepository::new(&conn);
+
+        repo.list().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+
+    Ok(Json(
+        projects
+            .into_iter()
+            .map(project_to_response)
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// `POST /projects` placeholder endpoint that creates a project.
-async fn create_project() -> &'static str {
-    "project created"
+async fn create_project(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateProjectPayload>,
+) -> Result<(StatusCode, Json<ProjectResponse>), StatusCode> {
+    if payload.name.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let conn = state.conn.clone();
+
+    let created = tokio::task::spawn_blocking(move || {
+        let conn = conn
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let repo = ProjectRepository::new(&conn);
+
+        repo.create(&NewProject {
+            name: payload.name,
+            description: payload.description,
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+
+    Ok((StatusCode::CREATED, Json(project_to_response(created))))
 }
 
 /// `GET /projects/{id}` placeholder endpoint that returns a single project.
-async fn get_project(Path(id): Path<String>) -> String {
-    format!("project id: {id}")
+async fn get_project(
+    Path(id): Path<i64>,
+    State(state): State<AppState>,
+) -> Result<Json<ProjectResponse>, StatusCode> {
+    let conn = state.conn.clone();
+
+    let project = tokio::task::spawn_blocking(move || {
+        let conn = conn
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let repo = ProjectRepository::new(&conn);
+
+        repo.find_by_id(id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(project_to_response(project)))
+}
+
+/// Request body for creating a project.
+#[derive(Debug, Deserialize)]
+struct CreateProjectPayload {
+    name: String,
+    description: Option<String>,
+}
+
+/// Response body returned by project endpoints.
+#[derive(Debug, Serialize)]
+struct ProjectResponse {
+    id: i64,
+    name: String,
+    description: Option<String>,
+    created_at: String,
+    updated_at: String,
 }
 
 /// Request body for creating a spec under a project/tag pair.
@@ -57,28 +142,68 @@ struct SpecResponse {
 /// `GET /projects/{id}/specs/{tag}` returns one spec for a project and tag.
 async fn get_project_spec_by_tag(
     Path((project_id, tag)): Path<(i64, String)>,
+    State(state): State<AppState>,
 ) -> Result<Json<SpecResponse>, StatusCode> {
     let parsed_tag = SpecTag::from_str(&tag).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let conn = state.conn.clone();
 
-    Ok(Json(SpecResponse {
-        project_id,
-        tag: parsed_tag.as_str().to_string(),
-        content: default_template(),
-    }))
+    let spec = tokio::task::spawn_blocking(move || {
+        let conn = conn
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let project_repo = ProjectRepository::new(&conn);
+
+        let project_exists = project_repo
+            .find_by_id(project_id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .is_some();
+
+        if !project_exists {
+            return Err(StatusCode::NOT_FOUND);
+        }
+
+        let repo = crate::infrastructure::persistence::spec::SpecRepository::new(&conn);
+
+        repo.find_by_project_and_tag(project_id, parsed_tag)
+            .map_err(map_spec_repo_error)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(spec_to_response(spec)))
 }
 
 /// `GET /projects/{id}/specs` returns all specs for a project.
-async fn list_project_specs(Path(project_id): Path<i64>) -> Json<Vec<SpecResponse>> {
-    Json(vec![SpecResponse {
-        project_id,
-        tag: SpecTag::Architecture.as_str().to_string(),
-        content: default_template(),
-    }])
+async fn list_project_specs(
+    Path(project_id): Path<i64>,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<SpecResponse>>, StatusCode> {
+    let conn = state.conn.clone();
+
+    let specs = tokio::task::spawn_blocking(move || {
+        let conn = conn
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let repo = crate::infrastructure::persistence::spec::SpecRepository::new(&conn);
+
+        repo.list_by_project(project_id).map_err(map_spec_repo_error)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+
+    Ok(Json(
+        specs
+            .into_iter()
+            .map(spec_to_response)
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// `POST /projects/{id}/specs/{tag}` creates a spec for the given tag.
 async fn create_project_spec(
     Path((project_id, tag)): Path<(i64, String)>,
+    State(state): State<AppState>,
     Json(payload): Json<CreateSpecPayload>,
 ) -> Result<(StatusCode, Json<SpecResponse>), StatusCode> {
     let parsed_tag = SpecTag::from_str(&tag).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -87,23 +212,69 @@ async fn create_project_spec(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let conn = state.conn.clone();
+
+    let created = tokio::task::spawn_blocking(move || {
+        let conn = conn
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let project_repo = ProjectRepository::new(&conn);
+
+        let project_exists = project_repo
+            .find_by_id(project_id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .is_some();
+
+        if !project_exists {
+            return Err(StatusCode::NOT_FOUND);
+        }
+
+        let repo = crate::infrastructure::persistence::spec::SpecRepository::new(&conn);
+
+        repo.create(&NewSpec {
+            project_id,
+            tag: parsed_tag,
+            content: payload.content,
+        })
+        .map_err(map_spec_repo_error)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+
     Ok((
         StatusCode::CREATED,
-        Json(SpecResponse {
-            project_id,
-            tag: parsed_tag.as_str().to_string(),
-            content: payload.content,
-        }),
+        Json(spec_to_response(created)),
     ))
 }
 
-/// Generates a placeholder spec template used by stub handlers.
-fn default_template() -> SpecContentTemplate {
-    SpecContentTemplate {
-        summary: "placeholder summary".to_string(),
-        goals: vec!["placeholder goal".to_string()],
-        requirements: vec!["placeholder requirement".to_string()],
-        acceptance_criteria: vec!["placeholder acceptance criteria".to_string()],
-        notes: Some("placeholder notes".to_string()),
+fn project_to_response(project: Project) -> ProjectResponse {
+    ProjectResponse {
+        id: project.id,
+        name: project.name,
+        description: project.description,
+        created_at: project.created_at,
+        updated_at: project.updated_at,
+    }
+}
+
+fn spec_to_response(spec: Spec) -> SpecResponse {
+    SpecResponse {
+        project_id: spec.project_id,
+        tag: spec.tag.as_str().to_string(),
+        content: spec.content,
+    }
+}
+
+fn map_spec_repo_error(error: RepoError) -> StatusCode {
+    match error {
+        RepoError::UniqueConstraint => StatusCode::CONFLICT,
+        RepoError::Sqlite(rusqlite::Error::SqliteFailure(sqlite_error, _))
+            if sqlite_error.extended_code == 787 =>
+        {
+            StatusCode::NOT_FOUND
+        }
+        RepoError::Sqlite(_) | RepoError::InvalidTag(_) | RepoError::JsonEncode(_) | RepoError::JsonDecode(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     }
 }

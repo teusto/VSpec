@@ -107,20 +107,16 @@ impl<'a> SpecRepository<'a> {
     }
 
     pub fn init_schema(&self) -> Result<()> {
-        self.conn.execute(
-            "
-            CREATE TABLE IF NOT EXISTS specs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id INTEGER NOT NULL,
-                tag TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(project_id, tag)
-            )
-            ",
-            [],
-        )?;
+        if !self.table_exists("specs")? {
+            self.create_specs_table_with_fk()?;
+            return Ok(());
+        }
+
+        if self.specs_has_project_fk()? {
+            return Ok(());
+        }
+
+        self.migrate_specs_table_add_project_fk()?;
 
         Ok(())
     }
@@ -208,6 +204,91 @@ impl<'a> SpecRepository<'a> {
         }
 
         Ok(None)
+    }
+
+    fn table_exists(&self, table_name: &str) -> Result<bool> {
+        let exists: i64 = self.conn.query_row(
+            "
+            SELECT EXISTS(
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'table' AND name = ?1
+            )
+            ",
+            params![table_name],
+            |row| row.get(0),
+        )?;
+
+        Ok(exists == 1)
+    }
+
+    fn specs_has_project_fk(&self) -> Result<bool> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA foreign_key_list(specs)")?;
+
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let referenced_table: String = row.get("table")?;
+            let from_col: String = row.get("from")?;
+            let to_col: String = row.get("to")?;
+
+            if referenced_table == "projects" && from_col == "project_id" && to_col == "id" {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn create_specs_table_with_fk(&self) -> Result<()> {
+        self.conn.execute(
+            "
+            CREATE TABLE IF NOT EXISTS specs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                tag TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                UNIQUE(project_id, tag)
+            )
+            ",
+            [],
+        )?;
+
+        Ok(())
+    }
+
+    fn migrate_specs_table_add_project_fk(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            BEGIN IMMEDIATE;
+
+            CREATE TABLE specs_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                tag TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                UNIQUE(project_id, tag)
+            );
+
+            INSERT INTO specs_new (id, project_id, tag, content, created_at, updated_at)
+            SELECT id, project_id, tag, content, created_at, updated_at
+            FROM specs;
+
+            DROP TABLE specs;
+            ALTER TABLE specs_new RENAME TO specs;
+
+            COMMIT;
+            ",
+        )?;
+
+        Ok(())
     }
 }
 
