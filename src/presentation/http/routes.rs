@@ -1,10 +1,13 @@
-use crate::infrastructure::persistence::spec::{SpecContentTemplate, SpecTag};
+use crate::{
+    app::AppState,
+    infrastructure::persistence::spec::{SpecContentTemplate, SpecTag},
+};
 use axum::{Json, Router, extract::Path, http::StatusCode, routing::get};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 /// Builds the HTTP router with health, project, and project-spec endpoints.
-pub fn router() -> Router {
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/projects", get(list_projects).post(create_project))
@@ -14,6 +17,7 @@ pub fn router() -> Router {
             "/projects/{id}/specs/{tag}",
             get(get_project_spec_by_tag).post(create_project_spec),
         )
+        .with_state(state)
 }
 
 /// `GET /health` health-check endpoint.
