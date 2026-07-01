@@ -8,11 +8,13 @@ use crate::{
 use axum::{
     Json, Router,
     extract::{Path, State},
+    response::{IntoResponse, Response},
     http::StatusCode,
     routing::get,
 };
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+use tower_http::trace::TraceLayer;
 
 /// Builds the HTTP router with health, project, and project-spec endpoints.
 pub fn router(state: AppState) -> Router {
@@ -25,7 +27,47 @@ pub fn router(state: AppState) -> Router {
             "/projects/{id}/specs/{tag}",
             get(get_project_spec_by_tag).post(create_project_spec),
         )
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+#[derive(Debug)]
+struct AppError {
+    status: StatusCode,
+    message: String,
+}
+
+impl AppError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorEnvelope {
+    error: ErrorBody,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    code: u16,
+    message: String,
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let body = Json(ErrorEnvelope {
+            error: ErrorBody {
+                code: self.status.as_u16(),
+                message: self.message,
+            },
+        });
+
+        (self.status, body).into_response()
+    }
 }
 
 /// `GET /health` health-check endpoint.
@@ -34,19 +76,20 @@ async fn health() -> &'static str {
 }
 
 /// `GET /projects` placeholder endpoint that lists projects.
-async fn list_projects(State(state): State<AppState>) -> Result<Json<Vec<ProjectResponse>>, StatusCode> {
+async fn list_projects(State(state): State<AppState>) -> Result<Json<Vec<ProjectResponse>>, AppError> {
     let conn = state.conn.clone();
 
     let projects = tokio::task::spawn_blocking(move || {
         let conn = conn
             .lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "failed to acquire database lock"))?;
         let repo = ProjectRepository::new(&conn);
 
-        repo.list().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        repo.list()
+            .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "failed to list projects"))
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "project listing task failed"))??;
 
     Ok(Json(
         projects
@@ -60,9 +103,9 @@ async fn list_projects(State(state): State<AppState>) -> Result<Json<Vec<Project
 async fn create_project(
     State(state): State<AppState>,
     Json(payload): Json<CreateProjectPayload>,
-) -> Result<(StatusCode, Json<ProjectResponse>), StatusCode> {
+) -> Result<(StatusCode, Json<ProjectResponse>), AppError> {
     if payload.name.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(AppError::new(StatusCode::BAD_REQUEST, "name must not be empty"));
     }
 
     let conn = state.conn.clone();
@@ -70,17 +113,17 @@ async fn create_project(
     let created = tokio::task::spawn_blocking(move || {
         let conn = conn
             .lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "failed to acquire database lock"))?;
         let repo = ProjectRepository::new(&conn);
 
         repo.create(&NewProject {
             name: payload.name,
             description: payload.description,
         })
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "failed to create project"))
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "project creation task failed"))??;
 
     Ok((StatusCode::CREATED, Json(project_to_response(created))))
 }
@@ -89,21 +132,21 @@ async fn create_project(
 async fn get_project(
     Path(id): Path<i64>,
     State(state): State<AppState>,
-) -> Result<Json<ProjectResponse>, StatusCode> {
+) -> Result<Json<ProjectResponse>, AppError> {
     let conn = state.conn.clone();
 
     let project = tokio::task::spawn_blocking(move || {
         let conn = conn
             .lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "failed to acquire database lock"))?;
         let repo = ProjectRepository::new(&conn);
 
         repo.find_by_id(id)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+            .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "failed to fetch project"))
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??
-    .ok_or(StatusCode::NOT_FOUND)?;
+    .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "project fetch task failed"))??
+    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "project not found"))?;
 
     Ok(Json(project_to_response(project)))
 }
@@ -143,23 +186,24 @@ struct SpecResponse {
 async fn get_project_spec_by_tag(
     Path((project_id, tag)): Path<(i64, String)>,
     State(state): State<AppState>,
-) -> Result<Json<SpecResponse>, StatusCode> {
-    let parsed_tag = SpecTag::from_str(&tag).map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<Json<SpecResponse>, AppError> {
+    let parsed_tag = SpecTag::from_str(&tag)
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "invalid spec tag"))?;
     let conn = state.conn.clone();
 
     let spec = tokio::task::spawn_blocking(move || {
         let conn = conn
             .lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "failed to acquire database lock"))?;
         let project_repo = ProjectRepository::new(&conn);
 
         let project_exists = project_repo
             .find_by_id(project_id)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "failed to fetch project"))?
             .is_some();
 
         if !project_exists {
-            return Err(StatusCode::NOT_FOUND);
+            return Err(AppError::new(StatusCode::NOT_FOUND, "project not found"));
         }
 
         let repo = crate::infrastructure::persistence::spec::SpecRepository::new(&conn);
@@ -168,8 +212,8 @@ async fn get_project_spec_by_tag(
             .map_err(map_spec_repo_error)
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??
-    .ok_or(StatusCode::NOT_FOUND)?;
+    .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "spec lookup task failed"))??
+    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "spec not found"))?;
 
     Ok(Json(spec_to_response(spec)))
 }
@@ -178,19 +222,19 @@ async fn get_project_spec_by_tag(
 async fn list_project_specs(
     Path(project_id): Path<i64>,
     State(state): State<AppState>,
-) -> Result<Json<Vec<SpecResponse>>, StatusCode> {
+) -> Result<Json<Vec<SpecResponse>>, AppError> {
     let conn = state.conn.clone();
 
     let specs = tokio::task::spawn_blocking(move || {
         let conn = conn
             .lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "failed to acquire database lock"))?;
         let repo = crate::infrastructure::persistence::spec::SpecRepository::new(&conn);
 
         repo.list_by_project(project_id).map_err(map_spec_repo_error)
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "spec listing task failed"))??;
 
     Ok(Json(
         specs
@@ -205,11 +249,12 @@ async fn create_project_spec(
     Path((project_id, tag)): Path<(i64, String)>,
     State(state): State<AppState>,
     Json(payload): Json<CreateSpecPayload>,
-) -> Result<(StatusCode, Json<SpecResponse>), StatusCode> {
-    let parsed_tag = SpecTag::from_str(&tag).map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<(StatusCode, Json<SpecResponse>), AppError> {
+    let parsed_tag = SpecTag::from_str(&tag)
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "invalid spec tag"))?;
 
     if payload.content.summary.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(AppError::new(StatusCode::BAD_REQUEST, "content.summary must not be empty"));
     }
 
     let conn = state.conn.clone();
@@ -217,16 +262,16 @@ async fn create_project_spec(
     let created = tokio::task::spawn_blocking(move || {
         let conn = conn
             .lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "failed to acquire database lock"))?;
         let project_repo = ProjectRepository::new(&conn);
 
         let project_exists = project_repo
             .find_by_id(project_id)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "failed to fetch project"))?
             .is_some();
 
         if !project_exists {
-            return Err(StatusCode::NOT_FOUND);
+            return Err(AppError::new(StatusCode::NOT_FOUND, "project not found"));
         }
 
         let repo = crate::infrastructure::persistence::spec::SpecRepository::new(&conn);
@@ -239,7 +284,7 @@ async fn create_project_spec(
         .map_err(map_spec_repo_error)
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "spec creation task failed"))??;
 
     Ok((
         StatusCode::CREATED,
@@ -265,16 +310,20 @@ fn spec_to_response(spec: Spec) -> SpecResponse {
     }
 }
 
-fn map_spec_repo_error(error: RepoError) -> StatusCode {
+fn map_spec_repo_error(error: RepoError) -> AppError {
     match error {
-        RepoError::UniqueConstraint => StatusCode::CONFLICT,
+        RepoError::UniqueConstraint => {
+            AppError::new(StatusCode::CONFLICT, "a spec with this tag already exists for the project")
+        }
         RepoError::Sqlite(rusqlite::Error::SqliteFailure(sqlite_error, _))
             if sqlite_error.extended_code == 787 =>
         {
-            StatusCode::NOT_FOUND
+            AppError::new(StatusCode::NOT_FOUND, "project not found")
         }
-        RepoError::Sqlite(_) | RepoError::InvalidTag(_) | RepoError::JsonEncode(_) | RepoError::JsonDecode(_) => {
-            StatusCode::INTERNAL_SERVER_ERROR
+        RepoError::Sqlite(_) => AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "database error"),
+        RepoError::InvalidTag(_) => AppError::new(StatusCode::BAD_REQUEST, "invalid spec tag"),
+        RepoError::JsonEncode(_) | RepoError::JsonDecode(_) => {
+            AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "spec content serialization error")
         }
     }
 }
