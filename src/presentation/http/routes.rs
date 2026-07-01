@@ -15,6 +15,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use tower_http::trace::TraceLayer;
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 
 /// Builds the HTTP router with health, project, and project-spec endpoints.
 pub fn router(state: AppState) -> Router {
@@ -27,7 +28,9 @@ pub fn router(state: AppState) -> Router {
             "/projects/{id}/specs/{tag}",
             get(get_project_spec_by_tag).post(create_project_spec),
         )
+        .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .with_state(state)
 }
 

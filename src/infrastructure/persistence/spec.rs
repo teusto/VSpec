@@ -1,9 +1,10 @@
 use rusqlite::{Connection, Error as SqlError, ErrorCode, Result, Row, params};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 /// JSON template stored in `Spec.content` and serialized to SQLite TEXT.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SpecContentTemplate {
     pub summary: String,
     pub goals: Vec<String>,
